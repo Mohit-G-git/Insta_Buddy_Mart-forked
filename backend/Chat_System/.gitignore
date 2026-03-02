@@ -1,0 +1,108 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Flutter/Dart/Pub
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+pubspec.lock
+
+# iOS/macOS
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+**/ios/Flutter/Flutter-Debug.xcframework
+**/ios/Flutter/Flutter-Release.xcframework
+**/ios/GoogleAppID.json
+**/ios/Runner/GoogleService-Info.plist
+**/ios/ServiceAccountKey.json
+**/ios/Runner/Info.plist
+**/macos/Flutter/Flutter.framework
+**/macos/Flutter/Flutter.podspec
+**/macos/Flutter/Flutter-Debug.xcframework
+**/macos/Flutter/Flutter-Release.xcframework
+**/macos/Runner/GoogleService-Info.plist
+**/macos/ServiceAccountKey.json
+Pods/
+.symlinks/
+Flutter/Flutter.framework
+Flutter/Flutter.podspec
+.generated.dart
+GeneratedPluginRegistrant.*
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcworkspace/xcshareddata/
+*.xcworkspace/xcuserdata/
+
+# Android
+**/android/local.properties
+**/android/.gradle
+**/android/captures/
+**/android/gradle-wrapper.jar
+**/android/gradle.properties
+**/android/.gradle/
+**/android/build/
+**/android/app/debug
+**/android/app/profile
+**/android/app/release
+.gradle
+*.jks
+*.keystore
+
+# Linux
+linux/flutter/ephemeral/
+
+# Windows
+windows/flutter/ephemeral/
+
+# Web
+web/plugins/
+web/js/
+web/wasm/
+.dart_frog/
+
+# General
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+.gradle/
+.m2/
+*.log
+/dist/
+/build/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Development
+.vscode/launch.json
+.vscode/settings.json
+.idea/
+*.sublime-workspace
+*.sublime-project
