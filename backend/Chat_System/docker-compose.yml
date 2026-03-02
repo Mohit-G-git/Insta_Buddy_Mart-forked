@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: buddyup_postgres
+    environment:
+      POSTGRES_USER: buddyup
+      POSTGRES_PASSWORD: buddyup_dev_123
+      POSTGRES_DB: buddyup_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buddyup"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - buddyup_network
+
+  redis:
+    image: redis:7
+    container_name: buddyup_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - buddyup_network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: buddyup_chat
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./src:/app/src
+    networks:
+      - buddyup_network
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  buddyup_network:
+    driver: bridge
