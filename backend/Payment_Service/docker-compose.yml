@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: buddyup_payment_postgres
+    environment:
+      POSTGRES_USER: buddyup
+      POSTGRES_PASSWORD: buddyup_dev_123
+      POSTGRES_DB: buddyup_payment_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - payment_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buddyup"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - buddyup_network
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: buddyup_payment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    ports:
+      - "3002:3002"
+    volumes:
+      - ./src:/app/src
+    networks:
+      - buddyup_network
+
+volumes:
+  payment_pgdata:
+
+networks:
+  buddyup_network:
+    driver: bridge
