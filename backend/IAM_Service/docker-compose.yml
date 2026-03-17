@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: buddyup_iam_postgres
+    environment:
+      POSTGRES_USER: buddyup
+      POSTGRES_PASSWORD: buddyup_dev_123
+      POSTGRES_DB: buddyup_iam_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - iam_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buddyup"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - buddyup_network
+
+  iam-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: buddyup_iam
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    ports:
+      - "3003:3003"
+    volumes:
+      - ./src:/app/src
+    networks:
+      - buddyup_network
+
+volumes:
+  iam_pgdata:
+
+networks:
+  buddyup_network:
+    driver: bridge
