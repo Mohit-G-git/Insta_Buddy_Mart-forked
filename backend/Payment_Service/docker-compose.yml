@@ -36,9 +36,25 @@ services:
     networks:
       - buddyup_network
 
+  payment-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: buddyup_payment_worker
+    command: ["node", "src/workers/autoReleaseWorker.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+    networks:
+      - buddyup_network
+
 volumes:
   payment_pgdata:
 
 networks:
   buddyup_network:
     driver: bridge
+

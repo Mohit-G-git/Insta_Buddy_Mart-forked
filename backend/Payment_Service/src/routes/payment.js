@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const auth = require('../middleware/auth');
 const { paymentLimiter } = require('../middleware/rateLimiter');
-const { validate, createOrderSchema, verifyPaymentSchema, refundSchema } = require('../utils/validators');
+const { validate, createOrderSchema, verifyPaymentSchema, refundSchema, orderStatusEventSchema } = require('../utils/validators');
 const paymentService = require('../services/paymentService');
 const escrowService = require('../services/escrowService');
 const { ValidationError } = require('../utils/errors');
@@ -82,6 +82,7 @@ router.post('/capture/:escrowId', auth, async (req, res, next) => {
 // POST /release/:escrowId
 // Release captured funds to the helper
 // Called when buyer confirms delivery
+// REQ-9: Now rejects locked escrows from this manual path
 // ============================================================================
 router.post('/release/:escrowId', auth, async (req, res, next) => {
   try {
@@ -96,6 +97,7 @@ router.post('/release/:escrowId', auth, async (req, res, next) => {
 // POST /refund/:escrowId
 // Full or partial refund
 // Body: { amount? (omit for full), reason? }
+// REQ-9: Now allows refund from locked and dispute_raised states
 // ============================================================================
 router.post('/refund/:escrowId', auth, async (req, res, next) => {
   try {
@@ -161,6 +163,57 @@ router.get('/my-payments', auth, async (req, res, next) => {
 
     const escrows = await escrowService.getEscrowsByUser(req.userId, page, limit);
     res.json({ page, limit, data: escrows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ============================================================================
+// REQ-9: POST /events/order-status
+// Internal endpoint for domain events (OrderDelivered, DisputeRaised)
+// Called by Order Service or event broker
+// Body: { event_id, event_type, occurred_at, order_id, escrow_id?, metadata? }
+// Returns: { processed: true/false, reason?, ... }
+// ============================================================================
+router.post('/events/order-status', auth, async (req, res, next) => {
+  try {
+    const { value, error } = validate(orderStatusEventSchema, req.body);
+    if (error) {
+      throw new ValidationError(error.message, error.details);
+    }
+
+    let result;
+
+    switch (value.event_type) {
+      case 'OrderDelivered':
+        result = await paymentService.onOrderDelivered({
+          orderId: value.order_id,
+          escrowId: value.escrow_id,
+          occurredAt: value.occurred_at,
+          eventId: value.event_id,
+        });
+        break;
+
+      case 'DisputeRaised':
+        result = await paymentService.onDisputeRaised({
+          orderId: value.order_id,
+          escrowId: value.escrow_id,
+          occurredAt: value.occurred_at,
+          eventId: value.event_id,
+        });
+        break;
+
+      default:
+        return res.status(400).json({
+          error: {
+            code: 'UNKNOWN_EVENT_TYPE',
+            message: `Unsupported event_type: ${value.event_type}`,
+          },
+        });
+    }
+
+    // Idempotent response semantics
+    res.status(result.processed ? 200 : 200).json(result);
   } catch (err) {
     next(err);
   }

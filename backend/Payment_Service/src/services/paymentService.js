@@ -3,10 +3,16 @@
 
 const razorpayService = require('./razorpayService');
 const escrowService = require('./escrowService');
+const autoReleaseJobService = require('./autoReleaseJobService');
+const processedEventService = require('./processedEventService');
+const db = require('../config/db');
 const { PaymentError, NotFoundError, ConflictError } = require('../utils/errors');
 
 // Buffer multiplier: 15% on top of item cost
 const BUFFER_MULTIPLIER = 0.15;
+
+// Auto-release delay: exactly 24 hours
+const AUTO_RELEASE_DELAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Calculate the Total Authorization Amount
@@ -219,16 +225,23 @@ async function capturePayment(escrowId) {
 }
 
 /**
- * STEP 4: Release Escrow
+ * STEP 4: Release Escrow (Manual Path)
  *
- * Called when delivery is confirmed by the buyer.
- * Marks escrow as released — the payout to the helper happens via Razorpay Route/Transfer
- * or a separate settlement process.
+ * Called when buyer confirms delivery (manual release).
+ * REQ-9: Now only allows release from 'captured' state.
+ * Locked escrows MUST go through the auto-release worker or admin override.
  */
 async function releaseEscrow(escrowId) {
   const escrow = await escrowService.getEscrowById(escrowId);
   if (!escrow) {
     throw new NotFoundError('Escrow record not found');
+  }
+
+  // REQ-9: Reject locked escrows from manual release path
+  if (escrow.status === 'locked') {
+    throw new ConflictError(
+      'Escrow is locked pending auto-release. Cannot manually release locked funds.'
+    );
   }
 
   if (escrow.status !== 'captured') {
@@ -259,6 +272,7 @@ async function releaseEscrow(escrowId) {
  *
  * Called when an order is cancelled or a dispute is resolved.
  * Supports full and partial refunds.
+ * REQ-9: Now also allows refund from 'locked' and 'dispute_raised' states.
  */
 async function refundPayment(escrowId, amount, reason) {
   const escrow = await escrowService.getEscrowById(escrowId);
@@ -266,7 +280,7 @@ async function refundPayment(escrowId, amount, reason) {
     throw new NotFoundError('Escrow record not found');
   }
 
-  if (!['authorized', 'captured'].includes(escrow.status)) {
+  if (!['authorized', 'captured', 'locked', 'dispute_raised'].includes(escrow.status)) {
     throw new ConflictError(`Payment cannot be refunded in status: ${escrow.status}`);
   }
 
@@ -292,6 +306,9 @@ async function refundPayment(escrowId, amount, reason) {
     });
     throw new PaymentError(`Refund failed: ${error.message}`);
   }
+
+  // If there are open auto-release jobs, cancel them on refund
+  await autoReleaseJobService.cancelJobsByEscrowId(escrowId, 'refund_initiated');
 
   const updated = await escrowService.markRefunded(escrowId, isPartial);
 
@@ -336,6 +353,246 @@ async function getEscrowDetails(escrowId) {
   };
 }
 
+// ============================================================================
+// REQ-9: Event Orchestrators
+// ============================================================================
+
+/**
+ * Handle OrderDelivered event
+ *
+ * 1. Validate idempotency (processed_events)
+ * 2. Validate escrow exists and is in captured (or already locked = idempotent)
+ * 3. Transition captured -> locked
+ * 4. Compute dueAt = occurredAt + 24 hours
+ * 5. Create auto-release job
+ * 6. Log audit transactions (lock + auto_release_scheduled)
+ *
+ * @param {object} params
+ * @param {string} params.orderId - UUID of the order
+ * @param {string} params.escrowId - UUID of the escrow (optional, will lookup by orderId)
+ * @param {string} params.occurredAt - ISO timestamp of when delivery occurred
+ * @param {string} params.eventId - UUID for idempotency
+ * @returns {object} Result with processing details
+ */
+async function onOrderDelivered({ orderId, escrowId, occurredAt, eventId }) {
+  const client = await db.pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Idempotency check
+    const isNew = await processedEventService.markEventProcessed(
+      { eventId, eventType: 'OrderDelivered', orderId },
+      client
+    );
+    if (!isNew) {
+      await client.query('COMMIT');
+      return { processed: false, reason: 'duplicate' };
+    }
+
+    // 2. Find escrow
+    let escrow;
+    if (escrowId) {
+      escrow = await escrowService.getEscrowForUpdate(escrowId, client);
+    } else {
+      // Lookup by order_id, then lock
+      escrow = await escrowService.getEscrowByOrderId(orderId);
+      if (escrow) {
+        escrow = await escrowService.getEscrowForUpdate(escrow.id, client);
+      }
+    }
+
+    if (!escrow) {
+      await client.query('ROLLBACK');
+      return { processed: false, reason: 'not_found' };
+    }
+
+    // Idempotent: if already locked, return success without re-processing
+    if (escrow.status === 'locked') {
+      await client.query('COMMIT');
+      return { processed: true, reason: 'already_locked', escrow_id: escrow.id };
+    }
+
+    // Only allow transition from captured
+    if (escrow.status !== 'captured') {
+      await client.query('ROLLBACK');
+      return { processed: false, reason: 'invalid_state', current_status: escrow.status };
+    }
+
+    // 3. Transition to locked
+    const lockedEscrow = await escrowService.markLocked(escrow.id, occurredAt, client);
+    if (!lockedEscrow) {
+      await client.query('ROLLBACK');
+      return { processed: false, reason: 'transition_failed' };
+    }
+
+    // 4. Compute due time: exactly +24 hours from occurredAt
+    const dueAt = new Date(new Date(occurredAt).getTime() + AUTO_RELEASE_DELAY_MS).toISOString();
+
+    // 5. Create auto-release job
+    const job = await autoReleaseJobService.createJob(
+      { escrowId: escrow.id, orderId, dueAt, scheduledFromEventAt: occurredAt },
+      client
+    );
+
+    // Update escrow with job reference
+    if (job) {
+      await escrowService.setAutoReleaseDue(escrow.id, dueAt, job.id, client);
+    }
+
+    // 6. Log audit transactions
+    const amount = parseFloat(escrow.total_authorized);
+
+    await escrowService.logTransaction({
+      escrowId: escrow.id,
+      type: 'lock',
+      amount,
+      status: 'success',
+    }, client);
+
+    await escrowService.logTransaction({
+      escrowId: escrow.id,
+      type: 'auto_release_scheduled',
+      amount,
+      status: 'success',
+    }, client);
+
+    await client.query('COMMIT');
+
+    console.log(
+      `[REQ-9] OrderDelivered processed: escrow=${escrow.id}, ` +
+      `job=${job?.id}, due_at=${dueAt}`
+    );
+
+    return {
+      processed: true,
+      escrow_id: escrow.id,
+      job_id: job?.id,
+      due_at: dueAt,
+      status: 'locked',
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[REQ-9] onOrderDelivered error:', error.message);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Handle DisputeRaised event
+ *
+ * 1. Validate idempotency (processed_events)
+ * 2. Validate escrow exists and is in locked/captured state
+ * 3. Transition to dispute_raised
+ * 4. Cancel any pending auto-release jobs
+ * 5. Log audit transactions (dispute + auto_release_cancelled)
+ *
+ * @param {object} params
+ * @param {string} params.orderId - UUID of the order
+ * @param {string} params.escrowId - UUID of the escrow (optional)
+ * @param {string} params.occurredAt - ISO timestamp
+ * @param {string} params.eventId - UUID for idempotency
+ * @returns {object} Result with processing details
+ */
+async function onDisputeRaised({ orderId, escrowId, occurredAt, eventId }) {
+  const client = await db.pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Idempotency check
+    const isNew = await processedEventService.markEventProcessed(
+      { eventId, eventType: 'DisputeRaised', orderId },
+      client
+    );
+    if (!isNew) {
+      await client.query('COMMIT');
+      return { processed: false, reason: 'duplicate' };
+    }
+
+    // 2. Find escrow
+    let escrow;
+    if (escrowId) {
+      escrow = await escrowService.getEscrowForUpdate(escrowId, client);
+    } else {
+      escrow = await escrowService.getEscrowByOrderId(orderId);
+      if (escrow) {
+        escrow = await escrowService.getEscrowForUpdate(escrow.id, client);
+      }
+    }
+
+    if (!escrow) {
+      await client.query('ROLLBACK');
+      return { processed: false, reason: 'not_found' };
+    }
+
+    // Idempotent: if already dispute_raised, return success
+    if (escrow.status === 'dispute_raised') {
+      await client.query('COMMIT');
+      return { processed: true, reason: 'already_dispute_raised', escrow_id: escrow.id };
+    }
+
+    // Only allow transition from locked or captured
+    if (!['locked', 'captured'].includes(escrow.status)) {
+      await client.query('ROLLBACK');
+      return { processed: false, reason: 'invalid_state', current_status: escrow.status };
+    }
+
+    // 3. Transition to dispute_raised
+    const updated = await escrowService.markDisputeRaised(escrow.id, client);
+    if (!updated) {
+      await client.query('ROLLBACK');
+      return { processed: false, reason: 'transition_failed' };
+    }
+
+    // 4. Cancel pending auto-release jobs
+    const cancelledJobs = await autoReleaseJobService.cancelJobsByEscrowId(
+      escrow.id, 'dispute_raised', client
+    );
+
+    // 5. Log audit transactions
+    const amount = parseFloat(escrow.total_authorized);
+
+    await escrowService.logTransaction({
+      escrowId: escrow.id,
+      type: 'dispute',
+      amount,
+      status: 'success',
+    }, client);
+
+    if (cancelledJobs.length > 0) {
+      await escrowService.logTransaction({
+        escrowId: escrow.id,
+        type: 'auto_release_cancelled',
+        amount,
+        status: 'success',
+      }, client);
+    }
+
+    await client.query('COMMIT');
+
+    console.log(
+      `[REQ-9] DisputeRaised processed: escrow=${escrow.id}, ` +
+      `cancelled_jobs=${cancelledJobs.length}`
+    );
+
+    return {
+      processed: true,
+      escrow_id: escrow.id,
+      cancelled_jobs: cancelledJobs.length,
+      status: 'dispute_raised',
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[REQ-9] onDisputeRaised error:', error.message);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   calculateTotal,
   createPaymentOrder,
@@ -344,4 +601,7 @@ module.exports = {
   releaseEscrow,
   refundPayment,
   getEscrowDetails,
+  onOrderDelivered,
+  onDisputeRaised,
 };
+
