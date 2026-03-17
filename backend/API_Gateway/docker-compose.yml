@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: buddyup_gateway
+    env_file: .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src:/app/src
+    networks:
+      - buddyup_network
+
+networks:
+  buddyup_network:
+    driver: bridge
