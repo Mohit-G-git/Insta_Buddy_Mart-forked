@@ -107,6 +107,56 @@ const refundSchema = Joi.object({
 });
 
 /**
+ * REQ-9: Schema for POST /events/order-status
+ * Envelope for internal domain events (OrderDelivered, DisputeRaised)
+ */
+const orderStatusEventSchema = Joi.object({
+  event_id: Joi.string()
+    .uuid({ version: 'uuidv4' })
+    .required()
+    .messages({
+      'string.guid': 'event_id must be a valid UUID',
+      'any.required': 'event_id is required',
+    }),
+
+  event_type: Joi.string()
+    .valid('OrderDelivered', 'DisputeRaised')
+    .required()
+    .messages({
+      'any.only': 'event_type must be OrderDelivered or DisputeRaised',
+      'any.required': 'event_type is required',
+    }),
+
+  occurred_at: Joi.string()
+    .isoDate()
+    .required()
+    .messages({
+      'string.isoDate': 'occurred_at must be a valid ISO 8601 timestamp',
+      'any.required': 'occurred_at is required',
+    }),
+
+  order_id: Joi.string()
+    .uuid({ version: 'uuidv4' })
+    .required()
+    .messages({
+      'string.guid': 'order_id must be a valid UUID',
+      'any.required': 'order_id is required',
+    }),
+
+  escrow_id: Joi.string()
+    .uuid({ version: 'uuidv4' })
+    .allow(null)
+    .optional()
+    .messages({
+      'string.guid': 'escrow_id must be a valid UUID',
+    }),
+
+  metadata: Joi.object()
+    .default({})
+    .optional(),
+});
+
+/**
  * Validate data against a Joi schema
  */
 function validate(schema, data) {
@@ -139,5 +189,7 @@ module.exports = {
   createOrderSchema,
   verifyPaymentSchema,
   refundSchema,
+  orderStatusEventSchema,
   validate,
 };
+

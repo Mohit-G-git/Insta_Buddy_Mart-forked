@@ -110,6 +110,7 @@ async function markCaptured(escrowId) {
 
 /**
  * Update escrow status to 'released' after delivery confirmation
+ * NOTE: Manual release only allowed from 'captured' state (guard tightening per REQ-9)
  */
 async function markReleased(escrowId) {
   const result = await db.query(
@@ -123,14 +124,117 @@ async function markReleased(escrowId) {
 }
 
 /**
+ * REQ-9: Update escrow status to 'locked' after OrderDelivered
+ * Allowed transition: captured -> locked
+ *
+ * @param {string} escrowId
+ * @param {string} deliveredAt - ISO timestamp of the delivery event
+ * @param {object} [client] - Optional DB client for transactional use
+ * @returns {object|null} Updated escrow row or null if transition not allowed
+ */
+async function markLocked(escrowId, deliveredAt, client) {
+  const queryFn = client || db;
+  const result = await queryFn.query(
+    `UPDATE escrow_ledger
+     SET status = 'locked',
+         locked_at = NOW(),
+         order_delivered_at = $2
+     WHERE id = $1 AND status = 'captured'
+     RETURNING *`,
+    [escrowId, deliveredAt]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * REQ-9: Set auto-release due time and job reference on escrow
+ *
+ * @param {string} escrowId
+ * @param {string} dueAt - ISO timestamp for scheduled release
+ * @param {string} jobId - UUID of the auto_release_jobs row
+ * @param {object} [client] - Optional DB client for transactional use
+ * @returns {object|null}
+ */
+async function setAutoReleaseDue(escrowId, dueAt, jobId, client) {
+  const queryFn = client || db;
+  const result = await queryFn.query(
+    `UPDATE escrow_ledger
+     SET auto_release_due_at = $2,
+         auto_release_job_id = $3
+     WHERE id = $1
+     RETURNING *`,
+    [escrowId, dueAt, jobId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * REQ-9: Mark escrow as dispute_raised
+ * Allowed transitions: locked -> dispute_raised, captured -> dispute_raised
+ *
+ * @param {string} escrowId
+ * @param {object} [client] - Optional DB client for transactional use
+ * @returns {object|null}
+ */
+async function markDisputeRaised(escrowId, client) {
+  const queryFn = client || db;
+  const result = await queryFn.query(
+    `UPDATE escrow_ledger
+     SET status = 'dispute_raised'
+     WHERE id = $1 AND status IN ('locked', 'captured')
+     RETURNING *`,
+    [escrowId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * REQ-9: Get escrow with row lock for worker safety
+ * MUST be called within a transaction
+ *
+ * @param {string} escrowId
+ * @param {object} client - DB client (must be inside a transaction)
+ * @returns {object|null}
+ */
+async function getEscrowForUpdate(escrowId, client) {
+  const queryFn = client || db;
+  const result = await queryFn.query(
+    'SELECT * FROM escrow_ledger WHERE id = $1 FOR UPDATE',
+    [escrowId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * REQ-9: Release escrow from locked state (worker/system path only)
+ * Only releases if status is 'locked' — rejects all other states
+ *
+ * @param {string} escrowId
+ * @param {object} [client] - Optional DB client for transactional use
+ * @returns {object|null}
+ */
+async function markReleasedBySystem(escrowId, client) {
+  const queryFn = client || db;
+  const result = await queryFn.query(
+    `UPDATE escrow_ledger
+     SET status = 'released', released_at = NOW()
+     WHERE id = $1 AND status = 'locked'
+     RETURNING *`,
+    [escrowId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
  * Update escrow status to 'refunded' or 'partially_refunded'
+ * REQ-9: Now also allows refund from 'locked' and 'dispute_raised' states
  */
 async function markRefunded(escrowId, isPartial) {
   const newStatus = isPartial ? 'partially_refunded' : 'refunded';
   const result = await db.query(
     `UPDATE escrow_ledger
      SET status = $2, refunded_at = NOW()
-     WHERE id = $1 AND status IN ('authorized', 'captured')
+     WHERE id = $1 AND status IN ('authorized', 'captured', 'locked', 'dispute_raised')
      RETURNING *`,
     [escrowId, newStatus]
   );
@@ -153,9 +257,11 @@ async function markFailed(escrowId) {
 
 /**
  * Log a payment transaction (audit trail)
+ * @param {object} [client] - Optional DB client for transactional use
  */
-async function logTransaction({ escrowId, type, amount, status, razorpayPaymentId, errorMessage }) {
-  const result = await db.query(
+async function logTransaction({ escrowId, type, amount, status, razorpayPaymentId, errorMessage }, client) {
+  const queryFn = client || db;
+  const result = await queryFn.query(
     `INSERT INTO payment_transactions
       (escrow_id, type, amount, status, razorpay_payment_id, error_message)
      VALUES ($1, $2, $3, $4, $5, $6)
@@ -201,6 +307,11 @@ module.exports = {
   markAuthorized,
   markCaptured,
   markReleased,
+  markLocked,
+  setAutoReleaseDue,
+  markDisputeRaised,
+  getEscrowForUpdate,
+  markReleasedBySystem,
   markRefunded,
   markFailed,
   logTransaction,
